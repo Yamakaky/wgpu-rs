@@ -1,8 +1,7 @@
 /// This example shows how to capture an image by rendering it to a texture, copying the texture to
 /// a buffer, and retrieving it from the buffer. This could be used for "taking a screenshot," with
 /// the added benefit that this method doesn't require a window to be created.
-use std::fs::File;
-use std::mem::size_of;
+use std::{mem::size_of, time::Duration};
 
 async fn run() {
     let adapter = wgpu::Instance::new()
@@ -29,15 +28,19 @@ async fn run() {
         .await
         .unwrap();
 
+    let device = std::sync::Arc::new(device);
+    std::thread::spawn({
+        let weak = std::sync::Arc::downgrade(&device);
+        move || {
+            while let Some(device) = weak.upgrade() {
+                device.poll(wgpu::Maintain::Wait);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    });
+
     // Rendered image is 256×256 with 32-bit RGBA color
     let size = 256u32;
-
-    // The output buffer lets us retrieve the data as an array
-    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        size: (size * size) as u64 * size_of::<u32>() as u64,
-        usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
-        label: None,
-    });
 
     let texture_extent = wgpu::Extent3d {
         width: size,
@@ -56,8 +59,20 @@ async fn run() {
         label: None,
     });
 
-    // Set the background to be red
-    let command_buffer = {
+    let (staging_depth_buffer_send, staging_depth_buffer_recv) = async_channel::unbounded();
+    for _ in 0..1 {
+        staging_depth_buffer_send
+            .send(device.create_buffer(&wgpu::BufferDescriptor {
+                size: (size * size) as u64 * size_of::<u32>() as u64,
+                usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
+                label: None,
+            }))
+            .await
+            .unwrap();
+    }
+
+    loop {
+        let output_buffer = staging_depth_buffer_recv.try_recv();
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -71,51 +86,41 @@ async fn run() {
             depth_stencil_attachment: None,
         });
 
-        // Copy the data from the texture to the buffer
-        encoder.copy_texture_to_buffer(
-            wgpu::TextureCopyView {
-                texture: &texture,
-                mip_level: 0,
-                array_layer: 0,
-                origin: wgpu::Origin3d::ZERO,
-            },
-            wgpu::BufferCopyView {
-                buffer: &output_buffer,
-                offset: 0,
-                bytes_per_row: size_of::<u32>() as u32 * size,
-                rows_per_image: 0,
-            },
-            texture_extent,
-        );
+        if let Ok(ref output_buffer) = output_buffer {
+            // Copy the data from the texture to the buffer
+            encoder.copy_texture_to_buffer(
+                wgpu::TextureCopyView {
+                    texture: &texture,
+                    mip_level: 0,
+                    array_layer: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                },
+                wgpu::BufferCopyView {
+                    buffer: output_buffer,
+                    offset: 0,
+                    bytes_per_row: size_of::<u32>() as u32 * size,
+                    rows_per_image: 0,
+                },
+                texture_extent,
+            );
+        }
 
-        encoder.finish()
-    };
+        queue.submit(Some(encoder.finish()));
 
-    queue.submit(Some(command_buffer));
-
-    // Note that we're not calling `.await` here.
-    let buffer_future = output_buffer.map_read(0, (size * size) as u64 * size_of::<u32>() as u64);
-
-    // Poll the device in a blocking manner so that our future resolves.
-    // In an actual application, `device.poll(...)` should
-    // be called in an event loop or on another thread.
-    device.poll(wgpu::Maintain::Wait);
-
-    // If a file system is available, write the buffer as a PNG
-    let has_file_system_available = cfg!(not(target_arch = "wasm32"));
-    if !has_file_system_available {
-        return;
-    }
-
-    if let Ok(mapping) = buffer_future.await {
-        let mut png_encoder = png::Encoder::new(File::create("red.png").unwrap(), size, size);
-        png_encoder.set_depth(png::BitDepth::Eight);
-        png_encoder.set_color(png::ColorType::RGBA);
-        png_encoder
-            .write_header()
-            .unwrap()
-            .write_image_data(mapping.as_slice())
-            .unwrap();
+        if let Ok(output_buffer) = output_buffer {
+            let sender = staging_depth_buffer_send.clone();
+            smol::Task::spawn(async move {
+                {
+                    output_buffer
+                        .map_read(0, (size * size) as u64 * size_of::<u32>() as u64)
+                        .await
+                        .unwrap();
+                }
+                sender.send(output_buffer).await.unwrap();
+            })
+            .detach();
+        }
+        futures_timer::Delay::new(std::time::Duration::from_millis(1)).await;
     }
 }
 
@@ -123,7 +128,7 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     {
         env_logger::init();
-        futures::executor::block_on(run());
+        smol::run(run());
     }
     #[cfg(target_arch = "wasm32")]
     {
