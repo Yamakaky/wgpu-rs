@@ -46,6 +46,16 @@ async fn execute_gpu(numbers: Vec<u32>) -> Vec<u32> {
         )
         .await
         .unwrap();
+    let device = std::sync::Arc::new(device);
+    /*
+    std::thread::spawn({
+        let weak = std::sync::Arc::downgrade(&device);
+        move || {
+            while let Some(device) = weak.upgrade() {
+                device.poll(wgpu::Maintain::Wait);
+            }
+        }
+    }); */
 
     let cs = include_bytes!("shader.comp.spv");
     let cs_module =
@@ -96,36 +106,30 @@ async fn execute_gpu(numbers: Vec<u32>) -> Vec<u32> {
             entry_point: "main",
         },
     });
+    loop {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&staging_buffer, 0, &storage_buffer, 0, size);
+        {
+            let mut cpass = encoder.begin_compute_pass();
+            cpass.set_pipeline(&compute_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch(numbers.len() as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, size);
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    encoder.copy_buffer_to_buffer(&staging_buffer, 0, &storage_buffer, 0, size);
-    {
-        let mut cpass = encoder.begin_compute_pass();
-        cpass.set_pipeline(&compute_pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.dispatch(numbers.len() as u32, 1, 1);
-    }
-    encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, size);
+        queue.submit(Some(encoder.finish()));
 
-    queue.submit(Some(encoder.finish()));
-
-    // Note that we're not calling `.await` here.
-    let buffer_future = staging_buffer.map_read(0, size);
-
-    // Poll the device in a blocking manner so that our future resolves.
-    // In an actual application, `device.poll(...)` should
-    // be called in an event loop or on another thread.
-    device.poll(wgpu::Maintain::Wait);
-
-    if let Ok(mapping) = buffer_future.await {
-        mapping
-            .as_slice()
-            .chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
-            .collect()
-    } else {
-        panic!("failed to run compute on gpu!")
+        // Note that we're not calling `.await` here.
+        let buffer_future = staging_buffer.map_read(0, size);
+        device.poll(wgpu::Maintain::Wait);
+        if let Ok(_mapping) = buffer_future.await {
+            dbg!(_mapping.as_slice()[0]);
+            dbg!("good");
+        } else {
+            panic!("failed to run compute on gpu!")
+        }
+        std::thread::sleep_ms(100);
     }
 }
 
